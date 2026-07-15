@@ -33,16 +33,12 @@ PDF_DIR = os.path.join(HERE, "pdf")
 UA = {"User-Agent": "Mozilla/5.0 (margin-tracker; personal use)"}
 
 # PDFの1行は「銘柄名 …… コード5桁 ISIN 数値×12」の順に記述されている。
-# ただしETFなど銘柄名が長い行は、座標で並べ直すと文字が混線するため、
 # 文字を「描画順（＝PDF内部の記述順）」のまま連結して復元する。
-#
 #   ...受益証券13570JP3047780006  ← ここからコードとISINを取る
-#
-# 数値12個は座標で右側だけを切り出す（こちらは常に正しく分離される）。
 CODE_RE = re.compile(r"([0-9A-Z]{5})(JP[0-9A-Z]{10}|[A-Z]{2}[0-9A-Z]{10})")
-NUM_RE = re.compile(r"▲\s*[\d,]+|[\d,]+|-")
 
-NUM_COL_X = 292   # このx座標より右が数値列
+NUM_COL_X = 292   # 通常はこのx座標より右が数値列
+NUM_COL_X_WIDE = 250  # 銘柄名が長く先頭数値が食い込む行の救済用
 ROW_TOL = 3       # 同じ行とみなすy方向の許容差(px)
 
 
@@ -75,7 +71,6 @@ def find_latest_pdf_url():
         href = a["href"]
         if not href.lower().endswith(".pdf"):
             continue
-        # ファイル名に syumatsu / 日付8桁 を含むものを候補にする
         m = re.search(r"(\d{8})", href)
         if "syumatsu" in href.lower() or m:
             url = href if href.startswith("http") else BASE + href
@@ -104,28 +99,37 @@ def download_pdf(url):
     return path
 
 
-def parse_num(s):
-    s = s.strip()
-    if s == "-" or s == "":
-        return None
-    neg = "▲" in s
-    v = int(re.sub(r"[▲\s,]", "", s))
-    return -v if neg else v
+def numbers_from_words(word_rows, key, x_min):
+    """指定行の単語列から、▲を直後の数値に統合しつつ数値リストを作る。
 
-
-def extract_asof(pdf):
-    """PDF先頭から「2026/7/3 申込み現在」の日付を拾う。"""
-    txt = pdf.pages[0].extract_text() or ""
-    m = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})\s*申込み現在", txt)
-    if m:
-        y, mo, d = (int(x) for x in m.groups())
-        return f"{y:04d}-{mo:02d}-{d:02d}"
-    return datetime.now().strftime("%Y-%m-%d")
+    ▲ は extract_words() で独立トークンに分割されることがあるため、
+    ここで直後の数値に符号として畳み込む。融合単語は複数数字を分解する。
+    """
+    ws = sorted(
+        (w for w in word_rows.get(key, []) if w["x1"] > x_min),
+        key=lambda w: w["x0"],
+    )
+    vals = []
+    neg = False
+    for w in ws:
+        t = w["text"]
+        if t == "▲":
+            neg = True
+            continue
+        found_digit = False
+        for num in re.findall(r"[\d,]+", t):
+            v = int(num.replace(",", ""))
+            vals.append(-v if neg else v)
+            neg = False
+            found_digit = True
+        # 数字を含まない記号だけの単語は無視（negは維持しない）
+        if not found_digit and t not in ("-",):
+            neg = False
+    return vals
 
 
 def parse_pdf(path, codes):
     """PDFから対象銘柄の制度信用データを抜き出す。"""
-    # 4桁コード -> PDF上の5桁コード(末尾0付き)
     code5 = {c + "0": c for c in codes}
     found = {}
 
@@ -145,7 +149,6 @@ def parse_pdf(path, codes):
                 wrows.setdefault(round(w["top"] / ROW_TOL), []).append(w)
 
             for key, cs in rows.items():
-                # 描画順のまま連結 → 「…受益証券13570JP3047780006」が復元される
                 joined = "".join(c["text"] for c in cs)
                 m = CODE_RE.search(joined)
                 if not m:
@@ -161,31 +164,19 @@ def parse_pdf(path, codes):
                 name = re.sub(r"^[A-Z]", "", name)   # 行頭の区分記号(A/B/J...)を除去
                 name = name.replace("\u3000", " ").strip()
 
-                # 数値12個を切り出す。
-                # 通常は x>=NUM_COL_X に綺麗に並ぶが、ETFなど銘柄名が長い行では
-                # 1個目の数値が銘柄名の単語に食い込むことがある。
-                # そこで境界をまたぐ単語からは、末尾の数値部分だけを救出する。
-                parts = []
-                for w in sorted(wrows.get(key, []), key=lambda w: w["x0"]):
-                    if w["x0"] >= NUM_COL_X:
-                        parts.append(w["text"])
-                    elif w["x1"] > NUM_COL_X:
-                        # 境界にまたがる融合単語 → 末尾の数字列だけ拾う
-                        m2 = re.search(r"([\d,]+)$", w["text"])
-                        if m2:
-                            parts.append(m2.group(1))
-
-                nums = NUM_RE.findall(" ".join(parts))
-                # 右揃えなので、余分が出た場合は末尾12個が正しい
-                if len(nums) > 12:
-                    nums = nums[-12:]
+                # 数値12個を抽出（▲統合方式）。
+                # まず通常の境界で取り、12個に満たなければ境界を広げて
+                # 銘柄名に食い込んだ先頭数値を救済する。右揃えなので末尾12個を採用。
+                nums = numbers_from_words(wrows, key, NUM_COL_X)
+                if len(nums) < 12:
+                    nums = numbers_from_words(wrows, key, NUM_COL_X_WIDE)
                 if len(nums) < 12:
                     continue
+                nums = nums[-12:]
 
-                v = [parse_num(x) for x in nums[:12]]
                 (s_tot, s_tot_wc, b_tot, b_tot_wc,
                  s_neg, s_neg_wc, s_std, s_std_wc,
-                 b_neg, b_neg_wc, b_std, b_std_wc) = v
+                 b_neg, b_neg_wc, b_std, b_std_wc) = nums
 
                 ratio = None
                 if s_std:  # 0 と None を除外
@@ -198,6 +189,16 @@ def parse_pdf(path, codes):
                     s_tot=s_tot, b_tot=b_tot, ratio=ratio,
                 )
     return asof, found
+
+
+def extract_asof(pdf):
+    """PDF先頭から「2026/7/3 申込み現在」の日付を拾う。"""
+    txt = pdf.pages[0].extract_text() or ""
+    m = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})\s*申込み現在", txt)
+    if m:
+        y, mo, d = (int(x) for x in m.groups())
+        return f"{y:04d}-{mo:02d}-{d:02d}"
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 def fmt(v):
