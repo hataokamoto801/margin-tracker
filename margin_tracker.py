@@ -167,9 +167,17 @@ def parse_pdf(path, codes):
                 # 数値12個を抽出（▲統合方式）。
                 # まず通常の境界で取り、12個に満たなければ境界を広げて
                 # 銘柄名に食い込んだ先頭数値を救済する。右揃えなので末尾12個を採用。
-                nums = numbers_from_words(wrows, key, NUM_COL_X)
-                if len(nums) < 12:
-                    nums = numbers_from_words(wrows, key, NUM_COL_X_WIDE)
+                # 数値は銘柄名と同じ束にある場合と、直後の束にある場合がある。
+                # 候補となる束を順に試し、12個そろったものを採用する。
+                nums = []
+                for k in (key, key + 1):
+                    for xmin in (NUM_COL_X, NUM_COL_X_WIDE):
+                        cand = numbers_from_words(wrows, k, xmin)
+                        if len(cand) >= 12:
+                            nums = cand
+                            break
+                    if nums:
+                        break
                 if len(nums) < 12:
                     continue
                 nums = nums[-12:]
