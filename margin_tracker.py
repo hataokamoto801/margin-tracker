@@ -38,7 +38,7 @@ UA = {"User-Agent": "Mozilla/5.0 (margin-tracker; personal use)"}
 CODE_RE = re.compile(r"([0-9A-Z]{5})(JP[0-9A-Z]{10}|[A-Z]{2}[0-9A-Z]{10})")
 
 NUM_COL_X = 292   # 通常はこのx座標より右が数値列
-NUM_COL_X_WIDE = 250  # 銘柄名が長く先頭数値が食い込む行の救済用
+NUM_COL_X_WIDE = 200  # 銘柄名が長く先頭数値が食い込む行の救済用
 ROW_TOL = 3       # 同じ行とみなすy方向の許容差(px)
 
 
