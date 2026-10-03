@@ -228,6 +228,7 @@ def report_text(asof, found, codes, source):
              "**左側：信用買い ／ 右側：信用売り**（制度信用・株数）", "",
              "- **前日比**：PDF記載の前営業日比。＋は増加、−は減少、—は比較値なし。",
              "- **信用倍率**：制度買い残 ÷ 制度売り残。売り残0は「—」。",
+             "- **★**：信用倍率が1倍以下（丸める前の数値で判定）。",
              "- ETF等は1口を1株として表示。金額ではありません。", "",
              "| コード | 銘柄名 | 買い残 | 買い残の前日比 | 売り残 | 売り残の前日比 | 信用倍率 |",
              "|---|---|---:|---:|---:|---:|---:|"]
@@ -236,7 +237,10 @@ def report_text(asof, found, codes, source):
         if d is None:
             lines.append(f"| {code} | 対象PDFに見つかりません | — | — | — | — | — |")
             continue
-        ratio = f"{d['ratio']:.2f}倍" if d['ratio'] is not None else "—"
+        # WORD JOINERで数値・単位・★の間の改行を防ぐ（GitHub Markdown対応）。
+        ratio = f"{d['ratio']:.2f}&#8288;倍" if d['ratio'] is not None else "—"
+        if d['s_std'] > 0 and d['b_std'] <= d['s_std']:
+            ratio += "&#8288;★"
         name = d['name'].replace("|", "&#124;").replace("\n", " ")
         lines.append(f"| {code} | {name} | **{fmt(d['b_std'])}** | {change(d['b_dc'])} | "
                      f"**{fmt(d['s_std'])}** | {change(d['s_dc'])} | {ratio} |")
