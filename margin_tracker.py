@@ -1,439 +1,301 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""JPX日次の制度信用残高をreport.md / history_daily.csvに出力。
+python margin_tracker.py
+python margin_tracker.py --pdf 20261001_mtall.pdf
+旧週次のhistory.csvは変更しません。
 """
-margin_tracker.py
-JPX「銘柄別信用取引週末残高」PDFを取得し、watchlist.txt の銘柄について
-制度信用（売残・買残・前週比・倍率）を抽出して report.md / history.csv を作る。
-
-レポートの表示順:
-    コード / 銘柄名 / 買い残 / 買い残の前週比 /
-    売り残 / 売り残の前週比 / 信用倍率
-
-使い方:
-    python margin_tracker.py                 # JPXから最新PDFを自動取得
-    python margin_tracker.py --pdf x.pdf     # 手元のPDFファイルを使う
-"""
-
 import argparse
 import csv
+import io
+import logging
 import os
 import re
-import sys
-from datetime import datetime, timezone
+import tempfile
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
+from html.parser import HTMLParser
+from bisect import bisect_left
 
 import pdfplumber
-import requests
-from bs4 import BeautifulSoup
 
-JPX_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/margin/05.html"
-BASE = "https://www.jpx.co.jp"
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-WATCHLIST = os.path.join(HERE, "watchlist.txt")
-HISTORY = os.path.join(HERE, "history.csv")
-REPORT = os.path.join(HERE, "report.md")
-PDF_DIR = os.path.join(HERE, "pdf")
-
+HERE = Path(__file__).resolve().parent
+WATCHLIST = HERE / "watchlist.txt"
+REPORT = HERE / "report.md"
+HISTORY = HERE / "history_daily.csv"
+JPX_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/margin/01.html"
+JST = timezone(timedelta(hours=9))
 UA = {"User-Agent": "Mozilla/5.0 (margin-tracker; personal use)"}
-
-# PDFの1行は「銘柄名 …… コード5桁 ISIN 数値×12」の順に記述されている。
-# 文字を「描画順（＝PDF内部の記述順）」のまま連結して復元する。
-#   ...受益証券13570JP3047780006  ← ここからコードとISINを取る
-CODE_RE = re.compile(
-    r"([0-9A-Z]{5})(JP[0-9A-Z]{10}|[A-Z]{2}[0-9A-Z]{10})"
-)
-
-NUM_COL_X = 292       # 通常はこのx座標より右が数値列
-NUM_COL_X_WIDE = 200  # 銘柄名が長く先頭数値が食い込む行の救済用
-ROW_TOL = 3          # 同じ行とみなすy方向の許容差(px)
+# 2026年9月25日申込分以降の新形式。A4横、14数値列。
+# 合計売残/前日比/上場比、合計買残/前日比/上場比、
+# 一般売残/前日比、制度売残/前日比、一般買残/前日比、制度買残/前日比。
+EDGES = (251, 293, 334, 365, 406, 448, 478, 520,
+         561, 603, 644, 685, 726, 768, 810)
+CODE_RE = re.compile(r"([0-9A-Z]{5})([A-Z]{2}[0-9A-Z]{10})")
+FIELDS = ["date", "code", "name", "std_sell", "std_sell_dc",
+          "std_buy", "std_buy_dc", "std_ratio", "total_sell", "total_buy"]
 
 
-def log(msg):
-    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+def log(message):
+    print(f"[{datetime.now(JST):%H:%M:%S}] {message}", flush=True)
+
+
+def atomic_write(path, text):
+    path = Path(path)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="",
+                                     dir=path.parent, delete=False) as f:
+        temp = f.name
+        f.write(text)
+    try:
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
 
 
 def load_watchlist():
     codes = []
-    with open(WATCHLIST, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            codes.append(line.split()[0])
-
+    for line in WATCHLIST.read_text(encoding="utf-8-sig").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        code = line.split()[0].upper()
+        if not re.fullmatch(r"[0-9A-Z]{4,5}", code):
+            raise ValueError(f"銘柄コードを確認してください: {code}")
+        if code not in codes:
+            codes.append(code)
     if not codes:
-        sys.exit("watchlist.txt に銘柄がありません")
-
+        raise ValueError("watchlist.txt に銘柄がありません")
     return codes
 
 
-def find_latest_pdf_url():
-    """JPXの一覧ページから最新のPDFリンクを探す。"""
-    log("JPXページを取得中...")
-    r = requests.get(JPX_PAGE, headers=UA, timeout=60)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.content, "html.parser")
+def fetch(url):
+    with urlopen(Request(url, headers=UA), timeout=120) as response:
+        return response.read()
 
-    cands = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if not href.lower().endswith(".pdf"):
-            continue
 
-        m = re.search(r"(\d{8})", href)
-        if "syumatsu" in href.lower() or m:
-            url = href if href.startswith("http") else BASE + href
-            key = m.group(1) if m else "0"
-            cands.append((key, url))
+class Links(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.hrefs = []
 
-    if not cands:
-        sys.exit(
-            "PDFリンクが見つかりません。"
-            "JPXのページ構成が変わった可能性があります。"
-        )
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self.hrefs.append(href)
 
-    cands.sort(reverse=True)
-    return cands[0][1]
+
+def find_latest_pdf():
+    parser = Links()
+    parser.feed(fetch(JPX_PAGE).decode("utf-8"))
+    candidates = []
+    for href in parser.hrefs:
+        url = urljoin(JPX_PAGE, href)
+        filename = Path(urlparse(url).path).name
+        m = re.fullmatch(r"(\d{8})_mtall\.pdf", filename, re.I)
+        if m:
+            asof = datetime.strptime(m[1], "%Y%m%d").date().isoformat()
+            candidates.append((asof, url))
+    if not candidates:
+        raise ValueError("日次PDF（YYYYMMDD_mtall.pdf）が見つかりません")
+    return max(candidates)
 
 
 def download_pdf(url):
-    os.makedirs(PDF_DIR, exist_ok=True)
-    name = os.path.basename(url.split("?")[0])
-    path = os.path.join(PDF_DIR, name)
-
-    if os.path.exists(path):
-        log(f"取得済みのPDFを使用: {name}")
-        return path
-
-    log(f"PDFをダウンロード中: {name}")
-    r = requests.get(url, headers=UA, timeout=120)
-    r.raise_for_status()
-
-    with open(path, "wb") as f:
-        f.write(r.content)
-
-    return path
+    log("最新の日次PDFを取得中...")
+    content = fetch(url)
+    if not content.startswith(b"%PDF-"):
+        raise ValueError("取得したファイルがPDFではありません")
+    # 毎回取得して、公表後の訂正も反映する。
+    return io.BytesIO(content)
 
 
-def numbers_from_words(word_rows, key, x_min):
-    """指定行の単語列から、▲を直後の数値に統合しつつ数値リストを作る。
-
-    ▲ は extract_words() で独立トークンに分割されることがあるため、
-    ここで直後の数値に符号として畳み込む。融合単語は複数数字を分解する。
-    """
-    ws = sorted(
-        (w for w in word_rows.get(key, []) if w["x1"] > x_min),
-        key=lambda w: w["x0"],
-    )
-
-    vals = []
-    neg = False
-
-    for w in ws:
-        t = w["text"]
-
-        if t == "▲":
-            neg = True
-            continue
-
-        found_digit = False
-        for num in re.findall(r"[\d,]+", t):
-            v = int(num.replace(",", ""))
-            vals.append(-v if neg else v)
-            neg = False
-            found_digit = True
-
-        # 数字を含まない記号だけの単語は無視（negは維持しない）
-        if not found_digit and t not in ("-",):
-            neg = False
-
-    return vals
+def integer(text):
+    s = re.sub(r"\s+", "", text).replace(",", "")
+    for sign in ("▲", "△", "−", "－"):
+        s = s.replace(sign, "-")
+    if s in ("-", "—"):
+        return None
+    if not re.fullmatch(r"[+-]?\d+", s):
+        raise ValueError(f"数値を読み取れません: {text!r}")
+    return int(s)
 
 
-def parse_pdf(path, codes):
-    """PDFから対象銘柄の制度信用データを抜き出す。"""
-    code5 = {c + "0": c for c in codes}
+def parse_pdf(source, codes=None):
+    wanted = set(codes) if codes is not None else None
     found = {}
-
-    with pdfplumber.open(path) as pdf:
-        asof = extract_asof(pdf)
-        log(
-            f"データ基準日: {asof} / "
-            f"全{len(pdf.pages)}ページを解析中..."
-        )
-
+    logging.getLogger("pdfminer").setLevel(logging.ERROR)
+    with pdfplumber.open(source) as pdf:
+        first = pdf.pages[0].extract_text(x_tolerance=1, y_tolerance=1) or ""
+        compact = re.sub(r"\s+", "", first)
+        m = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})申込(?:み)?現在", compact)
+        if not m:
+            raise ValueError("PDFのデータ基準日を読み取れません")
+        asof = date(*map(int, m.groups())).isoformat()
+        if "前日比" not in compact or "銘柄別信用取引残高" not in compact:
+            raise ValueError("日次の新形式PDFを指定してください（旧週次形式は非対応）")
+        log(f"基準日 {asof} / {len(pdf.pages)}ページを解析")
         for page in pdf.pages:
-            # y座標で行にまとめる（charsは描画順を保持している）
-            rows = {}
-            for c in page.chars:
-                rows.setdefault(
-                    round(c["top"] / ROW_TOL), []
-                ).append(c)
-
-            words = page.extract_words()
-            wrows = {}
-            for w in words:
-                wrows.setdefault(
-                    round(w["top"] / ROW_TOL), []
-                ).append(w)
-
-            for key, cs in rows.items():
-                joined = "".join(c["text"] for c in cs)
-                m = CODE_RE.search(joined)
-
-                if not m:
-                    continue
-
-                c5 = m.group(1)
-                if c5 not in code5:
-                    continue
-
-                # 銘柄名 = コードの手前から、種類表記を除いた部分
-                name = joined[:m.start()]
-                name = re.sub(
-                    r"(普通株式|受益証券|投資証券|ＪＤＲ|優先出資証券|"
-                    r"種類株式|優先株式).*$",
-                    "",
-                    name,
-                )
-                # 行頭の区分記号(A/B/J...)を除去
-                name = re.sub(r"^[A-Z]", "", name)
-                name = name.replace("\u3000", " ").strip()
-
-                # 数値12個を抽出（▲統合方式）。
-                # まず通常の境界で取り、12個に満たなければ境界を広げて
-                # 銘柄名に食い込んだ先頭数値を救済する。
-                # 右揃えなので末尾12個を採用。
-                # 数値は銘柄名と同じ束にある場合と、
-                # 直後の束にある場合がある。
-                nums = []
-                for k in (key, key + 1):
-                    for xmin in (NUM_COL_X, NUM_COL_X_WIDE):
-                        cand = numbers_from_words(wrows, k, xmin)
-                        if len(cand) >= 12:
-                            nums = cand
-                            break
-                    if nums:
+            if abs(page.width - 842) > 2 or abs(page.height - 595) > 2:
+                raise ValueError(f"{page.page_number}ページ: PDFの用紙サイズが変わっています")
+            # Shs. の先頭文字を使う。長い銘柄名が重なっても行を落とさない。
+            anchors = [ch for ch in page.chars if ch["text"] == "S"
+                       and abs(ch["x0"] - 239.511) < 0.02]
+            if not anchors:
+                raise ValueError(f"{page.page_number}ページ: 株数行が見つかりません")
+            # 行ごとの文字を一度に振り分ける。
+            rows = [[] for _ in anchors]
+            anchors.sort(key=lambda w: w["top"])
+            tops = [w["top"] for w in anchors]
+            for ch in page.chars:
+                i = bisect_left(tops, ch["top"])
+                for j in (i - 1, i):
+                    if 0 <= j < len(tops) and abs(tops[j] - ch["top"]) < 1:
+                        rows[j].append(ch)
                         break
-
-                if len(nums) < 12:
+            for chars in rows:
+                # 描画順を使い、長い銘柄名と市場区分の重なりを避ける。
+                raw = "".join(ch["text"] for ch in chars)
+                match = CODE_RE.search(raw)
+                if not match and re.search(r"\d+銘柄株数", re.sub(r"\s+", "", raw)):
+                    continue  # 最終ページの市場別集計
+                if not match:
+                    raise ValueError(f"{page.page_number}ページ: 銘柄コードを読めません")
+                code = match[1][:-1] if match[1].endswith("0") else match[1]
+                if wanted is not None and code not in wanted:
                     continue
-
-                nums = nums[-12:]
-
-                (
-                    s_tot, s_tot_wc, b_tot, b_tot_wc,
-                    s_neg, s_neg_wc, s_std, s_std_wc,
-                    b_neg, b_neg_wc, b_std, b_std_wc,
-                ) = nums
-
-                ratio = None
-                if s_std:
-                    ratio = round(b_std / s_std, 2)
-
-                found[code5[c5]] = dict(
-                    name=name,
-                    asof=asof,
-                    s_std=s_std,
-                    s_std_wc=s_std_wc,
-                    b_std=b_std,
-                    b_std_wc=b_std_wc,
-                    s_tot=s_tot,
-                    b_tot=b_tot,
-                    ratio=ratio,
-                )
-
+                name = raw[:match.start()]
+                name = re.split(r"普通株式|受益証券|投資証券|ＪＤＲ|優先出資証券|種類株式|優先株式", name)[0]
+                name = re.sub(r"^[AJKBMCTF]", "", name).strip()
+                # 描画順でコード・ISINより前の銘柄名を数値領域から除外。
+                offset = 0
+                numeric_chars = []
+                for ch in chars:
+                    offset += len(ch["text"])
+                    if offset > match.end():
+                        numeric_chars.append(ch)
+                cells = []
+                for left, right in zip(EDGES, EDGES[1:]):
+                    cell = sorted((ch for ch in numeric_chars
+                                   if left <= (ch["x0"] + ch["x1"]) / 2 < right),
+                                  key=lambda ch: ch["x0"])
+                    cells.append("".join(ch["text"] for ch in cell))
+                try:
+                    v = {i: integer(cells[i]) for i in range(14) if i not in (2, 5)}
+                    # 合計＝一般＋制度。列ずれは出力前にエラーにする。
+                    if any(v[i] is None for i in (0, 3, 6, 8, 10, 12)):
+                        raise ValueError("残高が欠落しています")
+                    if v[0] != v[6] + v[8] or v[3] != v[10] + v[12]:
+                        raise ValueError("残高の合計が一致しません")
+                    for total, general, standard in ((1, 7, 9), (4, 11, 13)):
+                        if all(v[i] is not None for i in (total, general, standard)):
+                            if v[total] != v[general] + v[standard]:
+                                raise ValueError("前日比の合計が一致しません")
+                    if any(v[i] < 0 for i in (0, 3, 6, 8, 10, 12)):
+                        raise ValueError("残高が負数です")
+                except ValueError as exc:
+                    raise ValueError(f"{page.page_number}ページ・{code}: {exc}") from exc
+                if code in found:
+                    raise ValueError(f"銘柄コードが重複しています: {code}")
+                found[code] = dict(name=name, s_std=v[8], s_dc=v[9],
+                                   b_std=v[12], b_dc=v[13], s_tot=v[0], b_tot=v[3],
+                                   ratio=v[12] / v[8] if v[8] else None)
+            page.close()
+    if not found:
+        raise ValueError("対象銘柄を1件も抽出できませんでした")
     return asof, found
 
 
-def extract_asof(pdf):
-    """PDF先頭から「2026/7/3 申込み現在」の日付を拾う。"""
-    txt = pdf.pages[0].extract_text() or ""
-    m = re.search(
-        r"(\d{4})/(\d{1,2})/(\d{1,2})\s*申込み現在",
-        txt,
-    )
-
-    if m:
-        y, mo, d = (int(x) for x in m.groups())
-        return f"{y:04d}-{mo:02d}-{d:02d}"
-
-    return datetime.now().strftime("%Y-%m-%d")
-
-
 def fmt(v):
-    return "-" if v is None else f"{v:,}"
+    return f"{v:,}"
 
 
-def fmt_wc(v):
-    """前週比を表示する。増加は＋、減少は−。"""
+def change(v):
     if v is None:
-        return "-"
-    if v > 0:
-        return f"+{v:,}"
-    if v < 0:
-        return f"−{abs(v):,}"
-    return "0"
+        return "—"
+    return f"+{v:,}" if v > 0 else (f"−{abs(v):,}" if v < 0 else "0")
 
 
-def write_report(asof, found, codes):
-    """買い残を左、売り残を右に揃えたレポートを作る。"""
-    generated_at = datetime.now(timezone.utc)
-
-    lines = [
-        "# 制度信用 週末残高レポート",
-        "",
-        f"- **データ基準日**: {asof} 申込み現在"
-        "（JPX 銘柄別信用取引週末残高）",
-        f"- **生成日時**: {generated_at:%Y-%m-%d %H:%M} (UTC)",
-        f"- **抽出**: {len(found)} / {len(codes)} 銘柄",
-        "",
-        "**左側：信用買い ／ 右側：信用売り**"
-        "（いずれも制度信用）",
-        "",
-        "- **前週比**：＋は増加、−は減少",
-        "- **信用倍率**：買い残 ÷ 売り残"
-        "（売り残が0の場合は「—」）",
-        "",
-        "| コード | 銘柄名 | 買い残 | 買い残の前週比 | "
-        "売り残 | 売り残の前週比 | 信用倍率 |",
-        "|---|---|---:|---:|---:|---:|---:|",
-    ]
-
-    for c in codes:
-        d = found.get(c)
-
-        if not d:
-            lines.append(
-                f"| {c} | (抽出できず) | - | - | - | - | - |"
-            )
+def report_text(asof, found, codes, source):
+    lines = ["# 制度信用 日次残高レポート", "",
+             f"- **データ基準日**：{asof} 申込み現在",
+             f"- **生成日時**：{datetime.now(JST):%Y-%m-%d %H:%M}（日本時間）",
+             f"- **抽出**：{len(found)} / {len(codes)} 銘柄",
+             f"- **出典**：{source}", "",
+             "**左側：信用買い ／ 右側：信用売り**（制度信用・株数）", "",
+             "- **前日比**：PDF記載の前営業日比。＋は増加、−は減少、—は比較値なし。",
+             "- **信用倍率**：制度買い残 ÷ 制度売り残。売り残0は「—」。",
+             "- ETF等は1口を1株として表示。金額ではありません。", "",
+             "| コード | 銘柄名 | 買い残 | 買い残の前日比 | 売り残 | 売り残の前日比 | 信用倍率 |",
+             "|---|---|---:|---:|---:|---:|---:|"]
+    for code in codes:
+        d = found.get(code)
+        if d is None:
+            lines.append(f"| {code} | 対象PDFに見つかりません | — | — | — | — | — |")
             continue
-
-        ratio = (
-            f"{d['ratio']:.2f}倍"
-            if d["ratio"] is not None
-            else "—"
-        )
-
-        lines.append(
-            f"| {c} | {d['name']} "
-            f"| **{fmt(d['b_std'])}** "
-            f"| {fmt_wc(d['b_std_wc'])} "
-            f"| **{fmt(d['s_std'])}** "
-            f"| {fmt_wc(d['s_std_wc'])} "
-            f"| {ratio} |"
-        )
-
+        ratio = f"{d['ratio']:.2f}倍" if d['ratio'] is not None else "—"
+        name = d['name'].replace("|", "&#124;").replace("\n", " ")
+        lines.append(f"| {code} | {name} | **{fmt(d['b_std'])}** | {change(d['b_dc'])} | "
+                     f"**{fmt(d['s_std'])}** | {change(d['s_dc'])} | {ratio} |")
     missing = [c for c in codes if c not in found]
     if missing:
-        lines += [
-            "",
-            "## 抽出できなかった銘柄",
-            "",
-            "、".join(missing),
-            "",
-            "> コードの入力ミス、上場廃止、"
-            "または信用対象外の可能性があります。",
-        ]
-
-    with open(REPORT, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-    log(
-        f"report.md を書き出しました"
-        f"（{len(found)}/{len(codes)}銘柄）"
-    )
+        lines += ["", "## 対象PDFに見つからなかった銘柄", "", "、".join(missing),
+                  "", "コード・信用対象・上場状況・PDFの形式をご確認ください。"]
+    return "\n".join(lines) + "\n"
 
 
-def append_history(asof, found, codes):
-    """同じ基準日の行が既にあれば追記しない（重複防止）。
-
-    既存のhistory.csvとの互換性を保つため、
-    CSVの列順は従来どおり売り・買いの順とする。
-    """
-    existing = set()
-
-    if os.path.exists(HISTORY):
-        with open(HISTORY, encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                existing.add((row["date"], row["code"]))
-
-    new_rows = []
-    for c in codes:
-        d = found.get(c)
-
-        if not d:
+def save_history(asof, found, codes):
+    rows = {}
+    if HISTORY.exists():
+        with HISTORY.open(encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames != FIELDS:
+                raise ValueError("history_daily.csv の列形式が違います")
+            for row in reader:
+                rows[(row['date'], row['code'])] = row
+    for code in codes:
+        if code not in found:
             continue
-
-        if (asof, c) in existing:
-            continue
-
-        new_rows.append([
-            asof,
-            c,
-            d["name"],
-            d["s_std"],
-            d["s_std_wc"],
-            d["b_std"],
-            d["b_std_wc"],
-            d["ratio"],
-            d["s_tot"],
-            d["b_tot"],
-        ])
-
-    if not new_rows:
-        log(
-            "history.csv: 同じ基準日のデータが既にあるため"
-            "追記しません"
-        )
-        return False
-
-    is_new = not os.path.exists(HISTORY)
-
-    with open(HISTORY, "a", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-
-        if is_new:
-            w.writerow([
-                "date",
-                "code",
-                "name",
-                "std_sell",
-                "std_sell_wc",
-                "std_buy",
-                "std_buy_wc",
-                "std_ratio",
-                "total_sell",
-                "total_buy",
-            ])
-
-        w.writerows(new_rows)
-
-    log(f"history.csv に {len(new_rows)} 行追記しました")
-    return True
+        d = found[code]
+        values = [asof, code, d['name'], d['s_std'], d['s_dc'],
+                  d['b_std'], d['b_dc'],
+                  f"{d['ratio']:.2f}" if d['ratio'] is not None else "",
+                  d['s_tot'], d['b_tot']]
+        rows[(asof, code)] = dict(zip(FIELDS, values))
+    out = io.StringIO(newline="")
+    writer = csv.DictWriter(out, fieldnames=FIELDS)
+    writer.writeheader()
+    writer.writerows(rows[k] for k in sorted(rows))
+    atomic_write(HISTORY, out.getvalue())
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pdf", help="手元のPDFを使う場合のパス")
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--pdf", help="手元の新形式日次PDF")
     args = ap.parse_args()
-
     codes = load_watchlist()
-    log(f"ウォッチ銘柄: {len(codes)}件")
-
-    path = args.pdf or download_pdf(find_latest_pdf_url())
-    asof, found = parse_pdf(path, codes)
-
-    if not found:
-        sys.exit(
-            "1銘柄も抽出できませんでした。"
-            "PDFの様式が変わった可能性があります。"
-        )
-
-    write_report(asof, found, codes)
-    append_history(asof, found, codes)
-    log("完了")
+    expected = None
+    if args.pdf:
+        source = Path(args.pdf)
+        source_label = source.name
+    else:
+        expected, url = find_latest_pdf()
+        source = download_pdf(url)
+        source_label = f"[JPX 銘柄別信用取引残高]({url})"
+    asof, found = parse_pdf(source, codes)
+    if expected is not None and asof != expected:
+        raise ValueError("リンクの日付とPDFの基準日が一致しません")
+    text = report_text(asof, found, codes, source_label)
+    save_history(asof, found, codes)
+    atomic_write(REPORT, text)
+    log(f"完了: {len(found)}/{len(codes)}銘柄、report.md / history_daily.csv を更新")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (ValueError, OSError) as exc:
+        raise SystemExit(f"エラー: {exc}")
