@@ -141,9 +141,19 @@ def parse_pdf(source, codes=None):
         for page in pdf.pages:
             if abs(page.width - 842) > 2 or abs(page.height - 595) > 2:
                 raise ValueError(f"{page.page_number}ページ: PDFの用紙サイズが変わっています")
-            # Shs. の先頭文字を使う。長い銘柄名が重なっても行を落とさない。
-            anchors = [ch for ch in page.chars if ch["text"] == "S"
-                       and abs(ch["x0"] - 239.511) < 0.02]
+            # 株数ラベル Shs. を文字列と配置で識別する。
+            # 日付により約1px動くため、特定のx座標との完全一致は使わない。
+            # extract_wordsでは長い銘柄名と結合するので描画順の文字を使う。
+            anchors = []
+            for i, ch in enumerate(page.chars):
+                if ch["text"] != "S" or not 220 <= ch["x0"] < EDGES[0]:
+                    continue
+                label = page.chars[i:i + 4]
+                if ("".join(c["text"] for c in label) == "Shs."
+                        and all(abs(c["top"] - ch["top"]) < 1 for c in label)
+                        and all(0 < label[j + 1]["x0"] - label[j]["x0"] < 5
+                                for j in range(3))):
+                    anchors.append(ch)
             if not anchors:
                 raise ValueError(f"{page.page_number}ページ: 株数行が見つかりません")
             # 行ごとの文字を一度に振り分ける。
