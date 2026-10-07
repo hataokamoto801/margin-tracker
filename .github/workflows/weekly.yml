@@ -2,8 +2,8 @@ name: Daily margin report
 
 on:
   schedule:
-    # UTC 08:17 = 日本時間 17:17（月〜金）
-    - cron: '17 8 * * 1-5'
+    # UTC 08:17 / 10:17 / 12:17 = 日本時間 17:17 / 19:17 / 21:17（月〜金）
+    - cron: '17 8,10,12 * * 1-5'
   workflow_dispatch:
 
 permissions:
